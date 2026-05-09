@@ -29,6 +29,15 @@ python main.py "张三的部门是什么"
 
 Configuration is read from `config.yaml` by default. Keep real API keys out of committed artifacts.
 
+Additional runtime commands:
+
+```powershell
+python main.py --interactive
+streamlit run streamlit_app.py
+```
+
+The runtime includes process-local answer/route caching, JSONL audit logging under `logs/`, optional interactive multi-turn memory, and a Streamlit visual demo.
+
 ## Answer Rules
 
 Always:
@@ -38,6 +47,8 @@ Always:
 - Use retrieved KB chunks only when they have meaningful body text and sufficient score.
 - Include sources in successful answers.
 - Say no when the question is outside scope or evidence is missing.
+- In multi-turn mode, resolve short follow-ups from the latest enterprise-domain turn only.
+- Record operational logs without API keys, tokens, passwords, or other secrets.
 
 Never:
 

@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from skill.config import Config, ConfigError, load_config, load_config_from_yaml
+from skill.observability import setup_logging
 from skill.qa_engine import QAEngine
 
 
@@ -127,8 +128,9 @@ def main() -> None:
         sys.exit(0)
 
     # 加载配置并创建引擎
+    setup_logging()
     config = _load_config_or_exit(args.config)
-    engine = QAEngine(config)
+    engine = QAEngine(config, enable_memory=args.interactive)
 
     if args.interactive:
         _run_interactive(engine)

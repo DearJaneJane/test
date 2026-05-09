@@ -8,9 +8,12 @@
 
 import logging
 import re
+from contextlib import closing
+from copy import deepcopy
 from datetime import date
 from typing import Any
 
+from skill.cache import TTLCache
 from skill.config import Config
 from skill.db_query import (
     get_connection,
@@ -24,6 +27,8 @@ from skill.db_query import (
 )
 from skill.intent_router import IntentResult, IntentRouter, IntentType
 from skill.kb_search import KBChunk, KnowledgeBase
+from skill.memory import ConversationMemory
+from skill.observability import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +67,12 @@ def _unknown_ascii_core_token(question: str) -> str | None:
         if any(ch.isalpha() for ch in token) and any(ch.isdigit() for ch in token):
             return token
     return None
+
+
+def _level_rank(level: str) -> int:
+    """Convert a P-level string such as P6 into a comparable integer."""
+    match = re.fullmatch(r"P(\d+)", level.strip().upper())
+    return int(match.group(1)) if match else -1
 
 
 def _query_core_token_missing_from_results(question: str, kb_results: list[KBChunk]) -> str | None:
@@ -111,11 +122,19 @@ class AnswerPolicy:
 class QAEngine:
     """问答引擎：串联意图识别、数据库查询、知识库检索。"""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        enable_cache: bool = True,
+        enable_memory: bool = False,
+        memory_turns: int = 5,
+    ) -> None:
         self._config = config
-        self._conn = get_connection(config.db_path)
         self._kb = KnowledgeBase(config.kb_path)
         self._router = IntentRouter(config)
+        self._answer_cache: TTLCache[str, str] | None = TTLCache(maxsize=128, ttl_seconds=300) if enable_cache else None
+        self._memory = ConversationMemory(max_turns=memory_turns) if enable_memory else None
 
     def answer(self, question: str) -> str:
         """
@@ -123,13 +142,31 @@ class QAEngine:
 
         流程：意图识别 → 数据获取 → 格式化回答 + 来源标注。
         """
+        cache_key = question.strip()
+        if self._answer_cache is not None and self._memory is None:
+            cached_answer = self._answer_cache.get(cache_key)
+            if cached_answer is not None:
+                log_event("answer_cache_hit", question=question)
+                return cached_answer
+
         intent = self._router.route(question)
+        if self._memory is not None:
+            intent = self._memory.resolve_followup(question, intent)
+
+        log_event(
+            "intent_resolved",
+            question=question,
+            intent=intent.intent.value,
+            db_query_type=intent.db_query_type,
+            entities=deepcopy(intent.entities),
+            confidence=intent.confidence,
+        )
 
         if intent.intent == IntentType.INJECTION_DETECTED:
-            return AnswerPolicy.security_rejection()
+            return self._finalize_answer(question, intent, AnswerPolicy.security_rejection(), cache_key)
 
         if intent.intent == IntentType.UNCLEAR:
-            return AnswerPolicy.out_of_scope()
+            return self._finalize_answer(question, intent, AnswerPolicy.out_of_scope(), cache_key)
 
         if intent.intent == IntentType.INJECTION_DETECTED:
             return "检测到潜在安全风险，该问题无法处理。"
@@ -151,18 +188,32 @@ class QAEngine:
         if intent.intent in (IntentType.KB_ONLY, IntentType.HYBRID):
             kb_results = self._handle_kb_search(question, intent)
 
-        return self._format_answer(question, intent, db_data, kb_results)
+        answer = self._format_answer(question, intent, db_data, kb_results)
+        return self._finalize_answer(question, intent, answer, cache_key)
+
+    def _finalize_answer(self, question: str, intent: IntentResult, answer: str, cache_key: str) -> str:
+        if self._memory is not None:
+            self._memory.remember(question, intent)
+        if self._answer_cache is not None and self._memory is None:
+            self._answer_cache.set(cache_key, answer)
+        log_event(
+            "answer_generated",
+            question=question,
+            intent=intent.intent.value,
+            answer_length=len(answer),
+        )
+        return answer
 
     # ── 数据获取 ──────────────────────────────────────────────────────
 
-    def _resolve_employee(self, entities: dict) -> dict[str, Any] | None:
+    def _resolve_employee(self, conn: Any, entities: dict) -> dict[str, Any] | None:
         """根据 entities 中的 name 或 id 解析员工信息。"""
         name = entities.get("employee_name")
         emp_id = entities.get("employee_id")
         if emp_id:
-            return get_employee_by_id(self._conn, emp_id)
+            return get_employee_by_id(conn, emp_id)
         if name:
-            return get_employee_by_name(self._conn, name)
+            return get_employee_by_name(conn, name)
         return None
 
     def _handle_db_query(self, intent: IntentResult) -> dict[str, Any]:
@@ -170,59 +221,59 @@ class QAEngine:
         qt = intent.db_query_type
         ent = intent.entities
         result: dict[str, Any] = {"type": qt, "found": False, "data": None, "source": ""}
+        with closing(get_connection(self._config.db_path)) as conn:
+            if qt == "employee_info":
+                emp = self._resolve_employee(conn, ent)
+                result["data"] = emp
+                result["found"] = emp is not None
+                result["source"] = f"employees 表 ({emp['employee_id']})" if emp else "employees 表"
 
-        if qt == "employee_info":
-            emp = self._resolve_employee(ent)
-            result["data"] = emp
-            result["found"] = emp is not None
-            result["source"] = f"employees 表 ({emp['employee_id']})" if emp else "employees 表"
+            elif qt == "dept_members":
+                dept = ent.get("department", "")
+                members = get_department_members(conn, dept) if dept else []
+                result["data"] = members
+                result["found"] = len(members) > 0
+                result["source"] = "employees 表"
 
-        elif qt == "dept_members":
-            dept = ent.get("department", "")
-            members = get_department_members(self._conn, dept) if dept else []
-            result["data"] = members
-            result["found"] = len(members) > 0
-            result["source"] = "employees 表"
+            elif qt == "employee_projects":
+                emp = self._resolve_employee(conn, ent)
+                if emp:
+                    projects = get_employee_projects(conn, emp["employee_id"])
+                    result["data"] = {"employee": emp, "projects": projects}
+                    result["found"] = len(projects) > 0
+                    result["source"] = "projects 表 + project_members 表"
+                else:
+                    result["data"] = None
 
-        elif qt == "employee_projects":
-            emp = self._resolve_employee(ent)
-            if emp:
-                projects = get_employee_projects(self._conn, emp["employee_id"])
-                result["data"] = {"employee": emp, "projects": projects}
+            elif qt == "attendance":
+                emp = self._resolve_employee(conn, ent)
+                if emp:
+                    year = ent.get("year") or 2026
+                    month = ent.get("month") or 2
+                    count = get_attendance_late_count(conn, emp["employee_id"], year, month)
+                    result["data"] = {"employee": emp, "late_count": count, "year": year, "month": month}
+                    result["found"] = True
+                    result["source"] = "attendance 表"
+                else:
+                    result["data"] = None
+
+            elif qt == "performance":
+                emp = self._resolve_employee(conn, ent)
+                if emp:
+                    year = ent.get("year") or 2025
+                    reviews = get_performance_reviews(conn, emp["employee_id"], year)
+                    result["data"] = {"employee": emp, "reviews": reviews, "year": year}
+                    result["found"] = len(reviews) > 0
+                    result["source"] = "performance_reviews 表"
+                else:
+                    result["data"] = None
+
+            elif qt == "project_list":
+                status = ent.get("project_status", "active")
+                projects = get_projects_by_status(conn, status) if status else []
+                result["data"] = projects
                 result["found"] = len(projects) > 0
-                result["source"] = "projects 表 + project_members 表"
-            else:
-                result["data"] = None
-
-        elif qt == "attendance":
-            emp = self._resolve_employee(ent)
-            if emp:
-                year = ent.get("year") or 2026
-                month = ent.get("month") or 2
-                count = get_attendance_late_count(self._conn, emp["employee_id"], year, month)
-                result["data"] = {"employee": emp, "late_count": count, "year": year, "month": month}
-                result["found"] = True
-                result["source"] = "attendance 表"
-            else:
-                result["data"] = None
-
-        elif qt == "performance":
-            emp = self._resolve_employee(ent)
-            if emp:
-                year = ent.get("year") or 2025
-                reviews = get_performance_reviews(self._conn, emp["employee_id"], year)
-                result["data"] = {"employee": emp, "reviews": reviews, "year": year}
-                result["found"] = len(reviews) > 0
-                result["source"] = "performance_reviews 表"
-            else:
-                result["data"] = None
-
-        elif qt == "project_list":
-            status = ent.get("project_status", "active")
-            projects = get_projects_by_status(self._conn, status) if status else []
-            result["data"] = projects
-            result["found"] = len(projects) > 0
-            result["source"] = "projects 表"
+                result["source"] = "projects 表"
 
         return result
 
@@ -367,8 +418,8 @@ class QAEngine:
         kb_results: list[KBChunk],
     ) -> str:
         """格式化混合查询结果，含晋升分析。"""
-        # 检测是否为晋升分析
-        if "晋升" in question and db_data and db_data.get("found"):
+        # 检测是否为晋升分析；多轮追问时关键词可能只存在于上一轮继承的 kb_query_hint。
+        if self._is_promotion_query(question, intent) and db_data and db_data.get("found"):
             return self._analyze_promotion(intent, db_data, kb_results)
 
         # 通用混合：拼接 DB + KB 结果
@@ -394,6 +445,11 @@ class QAEngine:
         source_str = " + ".join(sources)
         return f"{result}\n\n> 来源：{source_str}"
 
+    @staticmethod
+    def _is_promotion_query(question: str, intent: IntentResult) -> bool:
+        text = f"{question} {intent.kb_query_hint}"
+        return any(keyword in text for keyword in ("晋升", "P5", "P6", "promotion"))
+
     def _analyze_promotion(
         self,
         intent: IntentResult,
@@ -405,18 +461,19 @@ class QAEngine:
 
         当前硬编码 P5→P6 的判断逻辑（可扩展）。
         """
-        emp = self._resolve_employee(intent.entities)
-        if not emp:
-            name = intent.entities.get("employee_name", "该员工")
-            return f'未找到员工「{name}」的信息，无法进行晋升分析。'
+        with closing(get_connection(self._config.db_path)) as conn:
+            emp = self._resolve_employee(conn, intent.entities)
+            if not emp:
+                name = intent.entities.get("employee_name", "该员工")
+                return f'未找到员工「{name}」的信息，无法进行晋升分析。'
 
-        level = emp.get("level", "")
-        name = emp["name"]
-        emp_id = emp["employee_id"]
+            level = emp.get("level", "")
+            name = emp["name"]
+            emp_id = emp["employee_id"]
 
-        # 获取绩效和项目数据
-        reviews = get_performance_reviews(self._conn, emp_id, 2025)
-        projects = get_employee_projects(self._conn, emp_id)
+            # 获取绩效和项目数据
+            reviews = get_performance_reviews(conn, emp_id, 2025)
+            projects = get_employee_projects(conn, emp_id)
         hire_date = date.fromisoformat(emp["hire_date"])
         tenure_days = (_CURRENT_DATE - hire_date).days
         tenure_years = round(tenure_days / 365, 1)
@@ -426,6 +483,14 @@ class QAEngine:
         if level == "P5":
             return self._promotion_p5_to_p6(
                 name, level, tenure_years, reviews, projects, kb_results, sources
+            )
+
+        if self._is_p5_to_p6_context(intent, kb_results) and _level_rank(level) >= _level_rank("P6"):
+            sources.append("employees 表")
+            return (
+                f"**{name}（{level}）P5→P6 晋升分析**\n\n"
+                f"{name}当前职级已经是 {level}，已达到或超过 P6，不需要再按 P5→P6 条件评估。\n\n"
+                f"> 来源：{' + '.join(sources)}"
             )
 
         # 通用：暂无硬编码规则的职级
@@ -438,6 +503,13 @@ class QAEngine:
             f"请参考《{kb_source}》中的晋升条件。\n\n"
             f"> 来源：{' + '.join(sources)}"
         )
+
+    @staticmethod
+    def _is_p5_to_p6_context(intent: IntentResult, kb_results: list[KBChunk]) -> bool:
+        text = intent.kb_query_hint
+        for chunk in kb_results:
+            text += f" {chunk.section} {chunk.content[:80]}"
+        return "P5" in text and "P6" in text
 
     def _promotion_p5_to_p6(
         self,

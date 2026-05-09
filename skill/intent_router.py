@@ -10,12 +10,14 @@ API 调用失败时降级到基于关键词的规则判断。
 import json
 import logging
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
 from openai import OpenAI
 
+from skill.cache import TTLCache
 from skill.config import Config
 from skill.db_query import check_sql_injection
 
@@ -203,6 +205,7 @@ class IntentRouter:
             api_key=config.dashscope_api_key,
             base_url=config.dashscope_base_url,
         )
+        self._route_cache: TTLCache[str, IntentResult] = TTLCache(maxsize=256, ttl_seconds=600)
 
     def route(self, question: str) -> IntentResult:
         """
@@ -238,16 +241,23 @@ class IntentRouter:
 
         deterministic_result = self._fallback_classify(question)
 
+        cached_result = self._route_cache.get(question)
+        if cached_result is not None:
+            return deepcopy(cached_result)
+
         try:
             result = self._call_llm(question)
             if result is not None:
                 if result.intent == IntentType.UNCLEAR and deterministic_result.intent != IntentType.UNCLEAR:
+                    self._route_cache.set(question, deterministic_result)
                     return deterministic_result
+                self._route_cache.set(question, result)
                 return result
         except Exception as e:
             logger.warning("百炼 API 调用失败，降级到规则判断: %s", e)
 
         # ── 3. 降级到规则判断 ─────────────────────────────────────────
+        self._route_cache.set(question, deterministic_result)
         return deterministic_result
 
     def _call_llm(self, question: str) -> IntentResult | None:

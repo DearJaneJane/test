@@ -16,6 +16,10 @@
 - Duplicate `(source_file, section)` results are suppressed.
 - Section/source matches receive small, deterministic boosts.
 - No-hit answers are explicit and do not fabricate content.
+- Route results and final answers use bounded in-memory TTL caches to reduce repeated LLM/API and formatting work.
+- Interactive mode keeps a bounded recent-turn memory for employee follow-up questions.
+- Runtime audit events are written as JSONL without secrets.
+- `streamlit_app.py` provides a visual chat UI for local demos.
 
 ## Recommended Next Improvements
 
@@ -38,6 +42,13 @@
    - Track top-1 and top-3 recall.
    - Track false-positive rate for nonsense queries.
 
-5. Add observability:
-   - Log query, normalized query, top-k sources, scores, selected source, no-hit reason.
-   - Avoid logging secrets or sensitive raw fields.
+5. Expand observability:
+   - Add top-k sources, scores, selected source, latency, cache-hit ratio, and no-hit reason.
+   - Keep API keys, tokens, passwords, and private credentials redacted.
+
+## Operational Features
+
+- Cache: `skill.cache.TTLCache` is process-local, bounded, and expires entries by TTL. It is suitable for repeated interview/demo queries, not for cross-process persistence.
+- Logging: `skill.observability` writes JSONL events to `logs/enterprise-qa.jsonl`; the current payload focuses on route and answer lifecycle.
+- Multi-turn memory: `skill.memory.ConversationMemory` keeps the latest 5 successful enterprise-domain turns in interactive mode. It resolves short follow-ups such as "那李四呢" by inheriting the previous DB query type and replacing the employee entity.
+- Visualization: `streamlit_app.py` starts a local chat UI and reuses the same QA engine with memory enabled.
