@@ -1,0 +1,18 @@
+database:
+  type: sqlite
+  path: ./enterprise.db
+
+knowledge_base:
+  root_path: ./data/knowledge
+  index_type: bm25
+
+llm:
+  provider: dashscope
+  api_key: "请替换为你的阿里云百炼 API Key"
+  api_base: https://dashscope.aliyuncs.com/compatible-mode/v1
+  model: qwen-turbo
+
+search:
+  max_results: 3
+
+timezone: Asia/Shanghai

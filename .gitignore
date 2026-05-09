@@ -1,0 +1,11 @@
+# IDE
+.idea/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+
+# Optional generated DB
+enterprise.db
