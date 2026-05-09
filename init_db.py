@@ -22,6 +22,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _DATA_DIR = _SCRIPT_DIR / "data"
 _SCHEMA_PATH = _DATA_DIR / "schema.sql"
 _SEED_PATH = _DATA_DIR / "seed_data.sql"
+_CONFIG_PATH = _SCRIPT_DIR / "config.yaml"
 
 # 验证期望值
 _EXPECTED_COUNTS = {
@@ -37,8 +38,34 @@ _EXPECTED_ACTIVE_EMPLOYEES = 9
 
 def _get_db_path() -> Path:
     """从环境变量读取数据库路径，未设置时使用默认值。"""
-    raw = os.environ.get("ENTERPRISE_QA_DB_PATH", "./enterprise.db")
+    raw = _get_db_path_from_yaml() or os.environ.get("ENTERPRISE_QA_DB_PATH") or "./enterprise.db"
     return Path(raw).resolve()
+
+
+def _get_db_path_from_yaml() -> str | None:
+    """Read database.path from config.yaml when present."""
+    if not _CONFIG_PATH.exists():
+        return None
+
+    try:
+        import yaml
+    except ImportError:
+        return None
+
+    try:
+        raw = yaml.safe_load(_CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+    if not isinstance(raw, dict):
+        return None
+
+    database = raw.get("database")
+    if not isinstance(database, dict):
+        return None
+
+    path = database.get("path")
+    return str(path) if path else None
 
 
 def _read_sql_file(path: Path) -> str:

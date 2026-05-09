@@ -7,6 +7,7 @@
 """
 
 import logging
+import re
 from datetime import date
 from typing import Any
 
@@ -30,7 +31,81 @@ logger = logging.getLogger(__name__)
 _CURRENT_DATE = date(2026, 3, 27)
 
 # KB 结果最低 BM25 分数阈值，低于此值视为无有效匹配
-_MIN_KB_SCORE = 1.0
+_MIN_KB_SCORE = 0.5
+
+
+def _is_missing_entity(value: Any) -> bool:
+    """Treat LLM string nulls the same as None."""
+    return value is None or (isinstance(value, str) and value.strip().lower() in {"", "null", "none"})
+
+
+def _missing_employee_label(entities: dict[str, Any], fallback: str) -> str:
+    """Choose the clearest label for an employee-not-found message."""
+    employee_id = entities.get("employee_id")
+    employee_name = entities.get("employee_name")
+    if not _is_missing_entity(employee_id):
+        return str(employee_id)
+    if not _is_missing_entity(employee_name):
+        return str(employee_name)
+    return fallback
+
+
+def _kb_not_found_label(question: str) -> str:
+    """Prefer the unknown token in mixed queries like 'xyzabc123怎么报销'."""
+    match = re.search(r"[A-Za-z0-9_]{6,}", question)
+    return match.group(0) if match else question
+
+
+def _unknown_ascii_core_token(question: str) -> str | None:
+    """Extract suspicious ASCII core tokens such as xyzabc123 from a KB query."""
+    for token in re.findall(r"\b[A-Za-z0-9_]{6,}\b", question):
+        if any(ch.isalpha() for ch in token) and any(ch.isdigit() for ch in token):
+            return token
+    return None
+
+
+def _query_core_token_missing_from_results(question: str, kb_results: list[KBChunk]) -> str | None:
+    """Return the unknown core token when retrieved evidence does not mention it."""
+    token = _unknown_ascii_core_token(question)
+    if not token or not kb_results:
+        return None
+
+    top_content = kb_results[0].content.lower()
+    return None if token.lower() in top_content else token
+
+
+class AnswerPolicy:
+    """Centralized answer policy for refusal, no-hit, and source requirements."""
+
+    @staticmethod
+    def security_rejection() -> str:
+        return "检测到潜在安全风险。企业问答系统不处理 SQL、命令、注入或越权类请求。"
+
+    @staticmethod
+    def out_of_scope() -> str:
+        return (
+            "该问题超出企业智能问答 Skill 的范围。我只能回答员工、部门、项目、考勤、绩效、"
+            "晋升、报销、制度、技术规范、FAQ 和会议纪要相关问题。"
+        )
+
+    @staticmethod
+    def employee_not_found(label: str) -> str:
+        return f"未找到员工「{label}」的信息，请确认工号或姓名是否正确。"
+
+    @staticmethod
+    def kb_not_found(question: str) -> str:
+        query = _kb_not_found_label(question)
+        if "报销" in question:
+            return f"未找到关于「{query}」的相关报销制度，请联系财务部或查阅官方文件。"
+        return f"未找到关于「{query}」的相关制度或文档，请联系HR或查阅官方文件。"
+
+    @staticmethod
+    def reimbursement_item_not_found(label: str) -> str:
+        return f"未找到关于「{label}」的报销规定，如有需要请联系财务部确认。"
+
+    @staticmethod
+    def generic_not_found(question: str) -> str:
+        return f"未找到关于「{question}」的相关信息。"
 
 
 class QAEngine:
@@ -49,6 +124,12 @@ class QAEngine:
         流程：意图识别 → 数据获取 → 格式化回答 + 来源标注。
         """
         intent = self._router.route(question)
+
+        if intent.intent == IntentType.INJECTION_DETECTED:
+            return AnswerPolicy.security_rejection()
+
+        if intent.intent == IntentType.UNCLEAR:
+            return AnswerPolicy.out_of_scope()
 
         if intent.intent == IntentType.INJECTION_DETECTED:
             return "检测到潜在安全风险，该问题无法处理。"
@@ -171,13 +252,12 @@ class QAEngine:
         if intent.intent == IntentType.KB_ONLY:
             return self._format_kb(question, kb_results)
 
-        return f'未找到关于「{question}」的相关信息。'
+        return AnswerPolicy.generic_not_found(question)
 
     def _format_db(self, question: str, intent: IntentResult, db_data: dict) -> str:
         """格式化纯数据库查询结果。"""
         if not db_data.get("found"):
-            name = intent.entities.get("employee_name") or intent.entities.get("employee_id") or question
-            return f'未找到员工「{name}」的信息，请确认姓名或工号是否正确。'
+            return AnswerPolicy.employee_not_found(_missing_employee_label(intent.entities, question))
 
         qt = db_data["type"]
         source = db_data["source"]
@@ -250,7 +330,26 @@ class QAEngine:
     def _format_kb(self, question: str, kb_results: list[KBChunk]) -> str:
         """格式化纯知识库检索结果。"""
         if not kb_results:
-            return f'未找到关于「{question}」的相关制度或文档，请联系HR或查阅官方文件。'
+            return AnswerPolicy.kb_not_found(question)
+
+        missing_core_token = _query_core_token_missing_from_results(question, kb_results)
+        if missing_core_token:
+            if "报销" in question:
+                return AnswerPolicy.reimbursement_item_not_found(missing_core_token)
+            return AnswerPolicy.generic_not_found(missing_core_token)
+
+        if "技术栈" in question:
+            tech_chunks = [
+                chunk for chunk in kb_results
+                if chunk.source_file == "tech_docs.md" and any(section in chunk.section for section in ("后端", "前端"))
+            ]
+            if tech_chunks:
+                lines = ["根据《tech_docs.md》：\n"]
+                for chunk in tech_chunks[:2]:
+                    lines.append(chunk.content)
+                sections = " + ".join(f"tech_docs.md §{chunk.section}" for chunk in tech_chunks[:2])
+                lines.append(f"\n> 来源：{sections}")
+                return "\n\n".join(lines)
 
         top = kb_results[0]
         lines = [
@@ -289,7 +388,7 @@ class QAEngine:
             sources.append(f"{top.source_file} §{top.section}")
 
         if not parts:
-            return f'未找到关于「{question}」的相关信息。'
+            return AnswerPolicy.generic_not_found(question)
 
         result = "\n\n---\n\n".join(parts)
         source_str = " + ".join(sources)

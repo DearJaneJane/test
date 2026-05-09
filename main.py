@@ -10,8 +10,9 @@
 
 import argparse
 import sys
+from pathlib import Path
 
-from skill.config import Config, ConfigError, load_config
+from skill.config import Config, ConfigError, load_config, load_config_from_yaml
 from skill.qa_engine import QAEngine
 
 
@@ -27,9 +28,16 @@ _WELCOME = """
 _SEPARATOR = "\n" + "─" * 50 + "\n"
 
 
-def _load_config_or_exit() -> Config:
+_DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
+
+
+def _load_config_or_exit(config_path: str | None = None) -> Config:
     """加载配置，失败时打印友好错误信息并退出。"""
     try:
+        if config_path:
+            return load_config_from_yaml(config_path)
+        if _DEFAULT_CONFIG_PATH.exists():
+            return load_config_from_yaml(_DEFAULT_CONFIG_PATH)
         return load_config()
     except ConfigError as e:
         print(f"\n❌ 配置错误：\n{e}\n", file=sys.stderr)
@@ -101,6 +109,11 @@ def main() -> None:
         action="store_true",
         help="初始化数据库（执行 schema.sql + seed_data.sql）",
     )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="YAML config path. Defaults to ./config.yaml when it exists.",
+    )
     args = parser.parse_args()
 
     # 初始化数据库（不需要 API Key）
@@ -114,7 +127,7 @@ def main() -> None:
         sys.exit(0)
 
     # 加载配置并创建引擎
-    config = _load_config_or_exit()
+    config = _load_config_or_exit(args.config)
     engine = QAEngine(config)
 
     if args.interactive:

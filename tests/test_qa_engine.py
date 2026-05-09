@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from skill.config import Config
-from skill.intent_router import IntentResult, IntentType
+from skill.intent_router import IntentResult, IntentRouter, IntentType
 from skill.qa_engine import QAEngine
 
 
@@ -40,7 +40,7 @@ def engine(tmp_path_factory) -> QAEngine:
 
     config = Config(db_path=db_path, kb_path=_KB_PATH, dashscope_api_key="fake")
     eng = QAEngine(config)
-    eng._router = MagicMock(spec=IntentType)
+    eng._router = MagicMock(spec=IntentRouter)
     return eng
 
 

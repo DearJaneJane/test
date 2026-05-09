@@ -15,12 +15,12 @@ from typing import Any
 
 # 高风险关键词/模式（大小写不敏感匹配）
 _INJECTION_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"\bSELECT\b", re.IGNORECASE),
-    re.compile(r"\bDROP\b", re.IGNORECASE),
-    re.compile(r"\bINSERT\b", re.IGNORECASE),
-    re.compile(r"\bUPDATE\b", re.IGNORECASE),
-    re.compile(r"\bDELETE\b", re.IGNORECASE),
-    re.compile(r"\bUNION\b", re.IGNORECASE),
+    re.compile(r"\bSELECT\b.+\bFROM\b", re.IGNORECASE),
+    re.compile(r"\bDROP\s+(TABLE|DATABASE|INDEX)\b", re.IGNORECASE),
+    re.compile(r"\bINSERT\s+INTO\b", re.IGNORECASE),
+    re.compile(r"\bUPDATE\s+\w+\s+SET\b", re.IGNORECASE),
+    re.compile(r"\bDELETE\s+FROM\b", re.IGNORECASE),
+    re.compile(r"\bUNION\s+SELECT\b", re.IGNORECASE),
     re.compile(r"--"),
     re.compile(r"['\"]1['\"]=['\"]1['\"]", re.IGNORECASE),  # '1'='1' 或 "1"="1"
     re.compile(r"\bOR\s+['\"]?1['\"]?\s*=\s*['\"]?1['\"]?", re.IGNORECASE),

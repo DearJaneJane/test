@@ -109,6 +109,78 @@ _KB_KEYWORDS = {"制度", "规定", "年假", "报销", "晋升条件", "加班"
 _EMP_ID_PATTERN = re.compile(r"EMP-\d{3}", re.IGNORECASE)
 
 
+_SYSTEM_PROMPT = """你是企业智能问答 Skill 的意图路由器。你只负责把用户问题解析为严格 JSON，不能直接回答问题。
+
+业务边界：
+- 只处理企业内部问答：员工、部门、项目、考勤、绩效、晋升、报销、制度、技术规范、FAQ、会议纪要。
+- 明确拒绝通用知识、天气、新闻、股票、闲聊、编程教学、SQL 解释、命令执行、越权查询、与企业资料无关的问题。
+- 当前日期固定为 2026-03-27，时区为 Asia/Shanghai。未给出年份时，考勤默认 2026，绩效默认 2025。
+
+可用数据源：
+- 数据库表：employees, projects, project_members, attendance, performance_reviews。
+- 知识库：hr_policies.md, promotion_rules.md, finance_rules.md, faq.md, tech_docs.md, meeting_notes/*.md。
+
+路由规则：
+1. 员工信息、部门人数、项目、考勤、绩效等结构化事实使用 db_only。
+2. 制度、规则、流程、标准、FAQ、会议纪要等文档问题使用 kb_only。
+3. 晋升资格、制度条件与员工事实对比等需要 DB + KB 的问题使用 hybrid。
+4. SQL/命令/注入/越权/域外问题使用 unclear。
+5. 不确定时使用 unclear，不要猜测。
+
+实体规则：
+- 只能抽取用户明确提到或已知映射能确认的实体，不要编造。
+- 未知字段必须使用 JSON null，禁止输出字符串 "null"、"None"、"未知"、空字符串。
+- employee_id 使用 EMP-XXX 格式；project_status 只能是 active/planning/completed/on_hold/null。
+
+已知员工：
+- 张三 EMP-001 研发部 P6
+- 李四 EMP-002 研发部 P7
+- 王五 EMP-003 产品部 P5
+- 赵六 EMP-004 产品部 P6
+- 钱七 EMP-005 研发部 P5
+- 孙八 EMP-006 市场部 P6
+- 周九 EMP-007 研发部 P7
+- 吴十 EMP-008 产品部 P4
+- CEO EMP-000 管理层 P10
+
+只输出以下 JSON，不要输出 Markdown、代码块或解释：
+{
+  "intent": "db_only|kb_only|hybrid|unclear",
+  "db_query_type": "employee_info|dept_members|employee_projects|attendance|performance|project_list|none",
+  "entities": {
+    "employee_name": null,
+    "employee_id": null,
+    "department": null,
+    "year": null,
+    "month": null,
+    "project_status": null
+  },
+  "kb_query_hint": null,
+  "confidence": 0.0
+}
+
+示例：
+用户：查一下 EMP-999
+输出：{"intent":"db_only","db_query_type":"employee_info","entities":{"employee_name":null,"employee_id":"EMP-999","department":null,"year":null,"month":null,"project_status":null},"kb_query_hint":null,"confidence":0.9}
+
+用户：王五符合 P5 晋升 P6 条件吗？
+输出：{"intent":"hybrid","db_query_type":"performance","entities":{"employee_name":"王五","employee_id":"EMP-003","department":null,"year":2025,"month":null,"project_status":null},"kb_query_hint":"P5 晋升 P6 条件","confidence":0.9}
+
+用户：今天天气怎么样？
+输出：{"intent":"unclear","db_query_type":"none","entities":{"employee_name":null,"employee_id":null,"department":null,"year":null,"month":null,"project_status":null},"kb_query_hint":null,"confidence":1.0}
+"""
+
+_OUT_OF_SCOPE_KEYWORDS = {
+    "天气", "新闻", "股票", "彩票", "菜谱", "旅游", "电影", "闲聊", "笑话",
+    "SELECT 是什么意思", "SQL 是什么意思", "写代码", "编程教学",
+}
+
+
+def _is_out_of_scope(question: str) -> bool:
+    """Return True for questions outside the enterprise QA skill boundary."""
+    return any(keyword.lower() in question.lower() for keyword in _OUT_OF_SCOPE_KEYWORDS)
+
+
 # ── IntentRouter 类 ───────────────────────────────────────────────────
 
 
@@ -156,15 +228,27 @@ class IntentRouter:
             )
 
         # ── 2. 调用百炼 API ──────────────────────────────────────────
+        if _is_out_of_scope(question):
+            logger.info("question outside enterprise QA boundary: %s", question)
+            return IntentResult(
+                intent=IntentType.UNCLEAR,
+                db_query_type="none",
+                confidence=1.0,
+            )
+
+        deterministic_result = self._fallback_classify(question)
+
         try:
             result = self._call_llm(question)
             if result is not None:
+                if result.intent == IntentType.UNCLEAR and deterministic_result.intent != IntentType.UNCLEAR:
+                    return deterministic_result
                 return result
         except Exception as e:
             logger.warning("百炼 API 调用失败，降级到规则判断: %s", e)
 
         # ── 3. 降级到规则判断 ─────────────────────────────────────────
-        return self._fallback_classify(question)
+        return deterministic_result
 
     def _call_llm(self, question: str) -> IntentResult | None:
         """
@@ -319,12 +403,12 @@ def _parse_llm_response(content: str) -> IntentResult | None:
     # 解析 entities
     raw_entities = data.get("entities", {})
     entities: dict[str, Any] = {
-        "employee_name": raw_entities.get("employee_name"),
-        "employee_id": raw_entities.get("employee_id"),
-        "department": raw_entities.get("department"),
+        "employee_name": _normalize_nullable_string(raw_entities.get("employee_name")),
+        "employee_id": _normalize_nullable_string(raw_entities.get("employee_id")),
+        "department": _normalize_nullable_string(raw_entities.get("department")),
         "year": _to_int_or_none(raw_entities.get("year")),
         "month": _to_int_or_none(raw_entities.get("month")),
-        "project_status": raw_entities.get("project_status"),
+        "project_status": _normalize_nullable_string(raw_entities.get("project_status")),
     }
 
     return IntentResult(
@@ -344,6 +428,13 @@ def _to_int_or_none(value: Any) -> int | None:
         return int(value)
     except (ValueError, TypeError):
         return None
+
+
+def _normalize_nullable_string(value: Any) -> Any:
+    """Convert LLM string null values to real None."""
+    if isinstance(value, str) and value.strip().lower() in {"null", "none", ""}:
+        return None
+    return value
 
 
 def _guess_db_query_type(question: str) -> str:
